@@ -29,23 +29,27 @@ class HFSPEnv(gym.Env):
         if self.initial_job_times is not None:
             self.job_times = self.initial_job_times.copy()
         
-        # 动作空间：选择队列中第 K 个工件 (按 SPT 排序)
-        # 0: 选第1个 (SPT)
-        # ...
-        # 4: 选第5个
-        self.k_choices = 5
-        self.action_space = gym.spaces.Discrete(self.k_choices)
+        # 动作空间：30 个复合调度规则 (6 工件规则 * 5 机器规则)
+        self.action_space = gym.spaces.Discrete(30)
         
         # 状态空间：
-        # 1. 阶段 One-Hot (num_stages)
-        # 2. 全局/机器统计特征 (num_stages * 6 + 1)
-        # 3. 候选工件特征 (Top-K jobs * 2 features: [ProcTime, RemTime])
-        self.job_feat_dim = 2
-        self.state_dim = num_stages + (num_stages * 6 + 1) + (self.k_choices * self.job_feat_dim)
+        # 按照论文 3.3.2 节设计 8 类特征
+        # f1: 队列长度比 (1)
+        # f2: 阶段结束时间比 (1)
+        # f3: 累积平均负载比 (1)
+        # f4: 队列最大加工时间比 (1)
+        # f5: 队列最小加工时间比 (1)
+        # f6: 最小工时比 (当前/下一阶段) (1)
+        # f7: 最大工时比 (当前/下一阶段) (1)
+        # f8: 机器结束时间比 (统计值: Mean, Std, Min, Max) (4)
+        # 加上 阶段 One-Hot (num_stages)
+        self.state_dim = self.num_stages + 11
         self.observation_space = gym.spaces.Box(low=0, high=np.inf, shape=(self.state_dim,), dtype=np.float32)
 
         self.next_stage_idx = 0
-        self.next_machine_idx = 0
+
+        # self.next_machine_idx = 0  <-- 机器现在由 Action 动态选择，不再由 Environment 预选
+
 
     def reset(self):
         # 生成作业数据
@@ -59,6 +63,23 @@ class HFSPEnv(gym.Env):
         self.queues[0] = list(range(self.num_jobs))
         self.job_completion_times = np.zeros((self.num_jobs, self.num_stages))
         
+        # 预计算全局统计量 (用于状态归一化)
+        # 1. 每个阶段的平均加工时间 p_bar_j
+        self.avg_proc_times = np.mean(self.job_times, axis=0)
+        
+        # 2. 全局工时比最大值 (用于 f6, f7 归一化)
+        # ratio_i_j = p_{i,j} / p_{i,j+1}
+        self.max_proc_ratios = np.ones(self.num_stages) # default 1
+        for s in range(self.num_stages - 1):
+            # 避免除以 0
+            next_times = self.job_times[:, s+1].copy()
+            next_times[next_times == 0] = 1e-5
+            ratios = self.job_times[:, s] / next_times
+            self.max_proc_ratios[s] = np.max(ratios) if len(ratios) > 0 else 1.0
+        
+        # 3. 奖励归一化因子 (最大加工时间作为参考，用于论文公式 3.19)
+        self.reward_scale = np.max(self.job_times) if self.job_times.size > 0 else 1.0
+
         self.current_time = 0
         self.completed_jobs = 0
         self.previous_makespan = 0
@@ -70,140 +91,277 @@ class HFSPEnv(gym.Env):
 
     def _advance_to_decision(self):
         # 推进时间，直到有机器空闲且队列不为空
-        # 或者所有任务完成
         while self.completed_jobs < self.num_jobs:
-            # 1. 检查当前时间点是否有可行调度
+            # 1. 检查任意阶段是否有待处理工件且有机器空闲
+            # 这里的逻辑需要微调：以前是选定一个机器，现在只需要选定一个阶段
+            # 只要某阶段队列不为空，且存在至少一台机器空闲，就可以进行决策
             candidates = []
             for s in range(self.num_stages):
                 if len(self.queues[s]) > 0:
-                    # 找该阶段最早空闲的机器
                     min_time = min(self.machine_available_time[s])
                     if min_time <= self.current_time:
-                        m_idx = self.machine_available_time[s].index(min_time)
-                        candidates.append((s, m_idx))
+                        candidates.append(s)
             
             if candidates:
-                # 找到决策点！
                 # 简单策略：优先调度靠后的阶段 (First Valid)
-                # 也可以改为随机或固定顺序，这里取第一个
-                self.next_stage_idx, self.next_machine_idx = candidates[0]
+                self.next_stage_idx = candidates[0]
                 return
 
             # 2. 如果没有，推进时间到下一个机器释放点
             future_times = [t for stage_times in self.machine_available_time for t in stage_times if t > self.current_time]
             if not future_times:
-                # 理论上只有当所有任务都在队列中但无法处理（不可能）或已完成时才会到这
-                # 但这里 completed_jobs < num_jobs，说明还有任务没完
-                # 可能是任务还在前一阶段运行，还没到下一阶段队列
-                # 这种情况下，我们找所有运行中任务的最早完成时间
-                running_completion_times = []
-                for j in range(self.num_jobs):
-                    for s in range(self.num_stages):
-                        # 如果任务 j 在 s 阶段完成时间 > current_time，说明它还在跑？
-                        # 不完全是，job_completion_times 存的是历史。
-                        # 我们需要推断系统的下一个事件时间。
-                        # 简化：future_times 包含了所有机器释放时间。
-                        # 如果 future_times 为空，说明所有机器都在 current_time 之前释放了，但队列为空？
-                        # 这意味着所有剩余任务都在“传输中”？不，本模型没有传输时间。
-                        # 意味着所有未完成任务都在前序阶段处理中。
-                        pass
-                break # Should not happen if logic is correct
-            
-            self.current_time = min(future_times)
+                pass # Should not happen usually
+            else:
+                self.current_time = min(future_times)
 
     def _get_state(self):
+        # 实现论文 3.3.2 节定义的 8 个状态特征
+        s_idx = self.next_stage_idx
+        queue = self.queues[s_idx]
+        
         # 1. Stage One-Hot
         stage_vec = np.zeros(self.num_stages, dtype=np.float32)
-        if self.completed_jobs < self.num_jobs:
-            stage_vec[self.next_stage_idx] = 1.0
+        stage_vec[s_idx] = 1.0
         
-        # 2. 统计特征 (原有)
-        stat_state = []
-        for s in range(self.num_stages):
-            valid_times = [t - self.current_time for t in self.machine_available_time[s] if t > self.current_time]
-            if not valid_times: valid_times = [0.0]
-            avg_load = np.mean(valid_times)
-            std_load = np.std(valid_times) if len(valid_times) > 1 else 0.0
-            queue_len = len(self.queues[s])
-            stat_state.extend([avg_load, std_load, queue_len])
-            
-            if queue_len > 0:
-                q_times = [self.job_times[j, s] for j in self.queues[s]]
-                stat_state.extend([np.mean(q_times), np.max(q_times), np.min(q_times)])
-            else:
-                stat_state.extend([0.0, 0.0, 0.0])
-        stat_state.append(self.completed_jobs / self.num_jobs)
-        
-        # 3. 候选工件特征 (Top-K)
-        job_feats = []
-        if self.completed_jobs < self.num_jobs:
-            current_queue = self.queues[self.next_stage_idx]
-            # 按 SPT (当前阶段加工时间) 排序
-            # 我们需要获取工件ID
-            sorted_indices = np.argsort([self.job_times[j, self.next_stage_idx] for j in current_queue])
-            sorted_jobs = [current_queue[i] for i in sorted_indices]
-            
-            for k in range(self.k_choices):
-                if k < len(sorted_jobs):
-                    job_id = sorted_jobs[k]
-                    proc_time = self.job_times[job_id, self.next_stage_idx]
-                    rem_time = np.sum(self.job_times[job_id, self.next_stage_idx:])
-                    job_feats.extend([proc_time, rem_time])
-                else:
-                    job_feats.extend([0.0, 0.0])
-        else:
-            job_feats = [0.0] * (self.k_choices * self.job_feat_dim)
+        # 如果所有工件都做完了，返回全0 (或保持最后状态)
+        if self.completed_jobs == self.num_jobs:
+            return np.zeros(self.state_dim, dtype=np.float32)
 
-        return np.concatenate([stage_vec, stat_state, job_feats])
+        # 辅助计算：当前阶段所有机器的结束时间
+        # machine_available_time[s] 存储的是机器可用时间（即上一任务结束时间）
+        stage_machine_times = self.machine_available_time[s_idx]
+        max_stage_time = max(stage_machine_times) if stage_machine_times else 1e-5
+        if max_stage_time == 0: max_stage_time = 1e-5
+        
+        # 全局最大结束时间 (所有阶段)
+        global_max_time = max([max(m_times) for m_times in self.machine_available_time])
+        if global_max_time == 0: global_max_time = 1e-5
+
+        # --- 特征计算 ---
+        
+        # f1: 队列工件数量比例
+        f1 = len(queue) / self.num_jobs
+        
+        # f2: 当前阶段最大结束时间 / 全局最大结束时间
+        f2 = max_stage_time / global_max_time
+        
+        # f3: 累积平均负载比
+        # 公式 (3.13): (Sum_{k=1}^j Sum_{i in Q_k} p_{i,j}) / (p_bar_j * Sum_{k=1}^j |Q_k|)
+        # 解释：考察当前阶段以及之前所有阶段的队列。
+        # 分子：这些队列中的工件，在*当前阶段 j* 的加工时间总和。
+        # 分母：当前阶段 j 的平均加工时间 * 这些队列的总人数。
+        numer_f3 = 0.0
+        denom_count = 0
+        for k in range(s_idx + 1): # 0 to s_idx
+            q_k = self.queues[k]
+            denom_count += len(q_k)
+            for job_id in q_k:
+                numer_f3 += self.job_times[job_id, s_idx]
+        
+        avg_pj = self.avg_proc_times[s_idx]
+        if avg_pj == 0: avg_pj = 1e-5
+        if denom_count == 0:
+            f3 = 0.0
+        else:
+            f3 = numer_f3 / (avg_pj * denom_count)
+
+        # 针对当前队列的统计 (如果队列为空，给 0)
+        if len(queue) > 0:
+            q_proc_times = [self.job_times[j, s_idx] for j in queue]
+            max_p = np.max(q_proc_times)
+            min_p = np.min(q_proc_times)
+            
+            # f4: Max Proc / Avg Proc (Avg of current stage global)
+            f4 = max_p / avg_pj
+            
+            # f5: Min Proc / Avg Proc
+            f5 = min_p / avg_pj
+            
+            # f6 & f7: Proc(j) / Proc(j+1) ratios
+            if s_idx < self.num_stages - 1:
+                ratios = []
+                for j in queue:
+                    p_curr = self.job_times[j, s_idx]
+                    p_next = self.job_times[j, s_idx+1]
+                    if p_next == 0: p_next = 1e-5
+                    ratios.append(p_curr / p_next)
+                
+                min_r = np.min(ratios)
+                max_r = np.max(ratios)
+                global_max_r = self.max_proc_ratios[s_idx]
+                if global_max_r == 0: global_max_r = 1e-5
+                
+                f6 = min_r / global_max_r
+                f7 = max_r / global_max_r
+            else:
+                f6 = 0.0 # Last stage has no next stage
+                f7 = 0.0
+        else:
+            f4, f5, f6, f7 = 0.0, 0.0, 0.0, 0.0
+
+        # f8: 机器负载分布 (统计特征)
+        # 原文是针对特定机器 l 的 f_{l,8} = EndTime_l / Max_Stage_EndTime
+        # 为了作为状态输入，我们取这些比率的统计值: Mean, Std, Min, Max
+        machine_ratios = [t / max_stage_time for t in stage_machine_times]
+        f8_mean = np.mean(machine_ratios)
+        f8_std = np.std(machine_ratios)
+        f8_min = np.min(machine_ratios)
+        f8_max = np.max(machine_ratios) # Should be 1.0 usually
+        
+        # 组合特征向量
+        features = np.array([f1, f2, f3, f4, f5, f6, f7, f8_mean, f8_std, f8_min, f8_max], dtype=np.float32)
+        
+        return np.concatenate([stage_vec, features])
 
     def step(self, action):
         if self.completed_jobs == self.num_jobs:
             return self._get_state(), 0, True, {"makespan": self.previous_makespan}
 
-        # 1. 执行动作：从当前决策阶段的队列中选一个工件
+        # 解析动作：Action (0-29) -> (JobRule, MachineRule)
+        # Job Rules: 0-5
+        # Machine Rules: 0-4
+        job_rule_idx = action // 5
+        machine_rule_idx = action % 5
+        
         stage_idx = self.next_stage_idx
-        machine_idx = self.next_machine_idx
-        queue = self.queues[stage_idx]
+        queue = self.queues[stage_idx] # list of job_ids
         
-        # 修正 Pop 逻辑
-        # 我们重新获取排序后的 job_id
-        # queue is a list of job_ids
-        times = [(self.job_times[j, stage_idx], j) for j in queue]
-        times.sort() # sort by time
+        # --- 1. 执行工件选择规则 ---
+        # 预计算所有候选工件的相关属性
+        # job_times[j, s]: 当前阶段加工时间
+        # sum(job_times[j, s+1:]): 后继加工时间
+        # total_time: sum(job_times[j, :])
         
-        target_k = action if action < len(times) else len(times) - 1
-        selected_job_id = times[target_k][1]
+        candidates = []
+        for j in queue:
+            proc_time = self.job_times[j, stage_idx]
+            rem_time = np.sum(self.job_times[j, stage_idx+1:]) if stage_idx < self.num_stages - 1 else 0
+            total_time = np.sum(self.job_times[j, :])
+            candidates.append({
+                'id': j,
+                'proc': proc_time,
+                'rem': rem_time,
+                'ratio': proc_time / total_time if total_time > 0 else 0
+            })
+            
+        selected_job_id = -1
         
+        if job_rule_idx == 0: # SPT: 最短加工时间
+            selected_job_id = min(candidates, key=lambda x: x['proc'])['id']
+        elif job_rule_idx == 1: # LPT: 最长加工时间
+            selected_job_id = max(candidates, key=lambda x: x['proc'])['id']
+        elif job_rule_idx == 2: # SRPT: 最短后继时间
+            selected_job_id = min(candidates, key=lambda x: x['rem'])['id']
+        elif job_rule_idx == 3: # LRPT: 最长后继时间
+            selected_job_id = max(candidates, key=lambda x: x['rem'])['id']
+        elif job_rule_idx == 4: # 最小比率 (Proc / Total)
+            selected_job_id = min(candidates, key=lambda x: x['ratio'])['id']
+        elif job_rule_idx == 5: # 最大比率 (Proc / Total)
+            selected_job_id = max(candidates, key=lambda x: x['ratio'])['id']
+        else:
+            selected_job_id = candidates[0]['id'] # Fallback
+            
         self.queues[stage_idx].remove(selected_job_id)
         
-        # 2. 计算时间
+        # --- 2. 执行机器选择规则 ---
+        # 候选机器：所有机器 (包括非空闲的，因为可以插入队列，或者等待释放)
+        # 但通常调度是针对"何时开始"，这里简化为：只能选当前阶段的机器
+        # 既然 _advance_to_decision 保证了至少有一台机器空闲 (或者即将空闲)，
+        # 我们需要计算每台机器如果处理该工件，会发生什么。
+        
+        machines = []
+        num_machines = self.machines_per_stage[stage_idx]
         proc_time = self.job_times[selected_job_id, stage_idx]
-        start_time = max(self.current_time, self.machine_available_time[stage_idx][machine_idx])
         
+        # 工件到达时间 (上一阶段完成时间)
+        arrival_time = 0
         if stage_idx > 0:
-            prev_finish = self.job_completion_times[selected_job_id, stage_idx - 1]
-            start_time = max(start_time, prev_finish)
+            arrival_time = self.job_completion_times[selected_job_id, stage_idx - 1]
             
-        finish_time = start_time + proc_time
+        for m in range(num_machines):
+            avail_time = self.machine_available_time[stage_idx][m]
+            start_time = max(self.current_time, avail_time, arrival_time)
+            finish_time = start_time + proc_time
+            idle_added = max(0, start_time - avail_time) # 空闲时间增加量
+            
+            machines.append({
+                'idx': m,
+                'avail': avail_time,
+                'finish': finish_time,
+                'idle': idle_added
+            })
+            
+        selected_machine_idx = -1
         
-        self.machine_available_time[stage_idx][machine_idx] = finish_time
-        self.job_completion_times[selected_job_id, stage_idx] = finish_time
+        if machine_rule_idx == 0: # 最大结束时间 (为什么选最大的？可能为了负载均衡？按论文实现)
+            selected_machine_idx = max(machines, key=lambda x: x['avail'])['idx'] 
+            # 注意：原文说“加工结束时间最大的机器”，可能是指 avail_time 最大，也可能是 finish_time 最大。
+            # 通常为了最小化 Cmax，应该选 finish_time 最小的。
+            # 但既然原文写了“最大”，可能是为了填补空隙？或者原文是反向规则？
+            # 我们这里严格按字面意思：Avail Time Max (当前最忙的机器？)
+            # 或者是指 Finish Time Max。我们假设是 Avail Time。
+            pass
+        
+        # 修正理解：通常规则是为了优化。
+        # Rule 1: Max Completion Time (of the machine currently). -> 可能是为了利用碎片？
+        # Rule 2: Min Completion Time. -> 标准 Greedy
+        # Rule 3: Min Idle Time Increment.
+        # Rule 4: Min (Idle + Proc).
+        # Rule 5: Min Max Completion Time (Makespan increment).
+        
+        if machine_rule_idx == 0: # 1. 当前阶段加工结束时间最大 (Avail Time Max)
+            selected_machine_idx = max(machines, key=lambda x: x['avail'])['idx']
+        elif machine_rule_idx == 1: # 2. 当前阶段加工结束时间最小 (Avail Time Min) - 标准贪心
+            selected_machine_idx = min(machines, key=lambda x: x['avail'])['idx']
+        elif machine_rule_idx == 2: # 3. 空闲时间增加最少
+            selected_machine_idx = min(machines, key=lambda x: x['idle'])['idx']
+        elif machine_rule_idx == 3: # 4. (空闲 + 加工) 最少 -> 其实就是 Finish - Avail 最少？
+            # Idle + Proc = (Start - Avail) + Proc = Finish - Avail.
+            selected_machine_idx = min(machines, key=lambda x: x['idle'] + proc_time)['idx']
+        elif machine_rule_idx == 4: # 5. 当前阶段最大结束时间最短 (Min Finish Time)
+            selected_machine_idx = min(machines, key=lambda x: x['finish'])['idx']
+        else:
+            selected_machine_idx = 0
+            
+        # --- 3. 更新状态 ---
+        m_idx = selected_machine_idx
+        
+        # 重新计算最终的时间 (因为上面是模拟)
+        real_avail = self.machine_available_time[stage_idx][m_idx]
+        real_start = max(self.current_time, real_avail, arrival_time)
+        real_finish = real_start + proc_time
+        
+        self.machine_available_time[stage_idx][m_idx] = real_finish
+        self.job_completion_times[selected_job_id, stage_idx] = real_finish
         
         if stage_idx < self.num_stages - 1:
             self.queues[stage_idx + 1].append(selected_job_id)
         else:
             self.completed_jobs += 1
             
-        # 3. 计算奖励
+        # 4. 计算奖励 (基于论文 3.3.3 节: 空闲时间增量)
+        # 获取被选机器产生的空闲时间
+        # machines 列表按索引顺序对应 machine 0..M-1
+        selected_machine_entry = machines[selected_machine_idx]
+        idle_added = selected_machine_entry['idle']
+        
+        # 公式 (3.18): r = idletime(t) - idletime(t+1)
+        # idletime 增加，则 r 为负。r = - (NewIdle - OldIdle) = - idle_added
+        raw_reward = -idle_added
+        
+        # 公式 (3.19): 归一化到 [-1, 1]
+        # 使用全局最大加工时间作为归一化分母的估计
+        normalized_reward = raw_reward / self.reward_scale
+        
+        # 确保在 [-1, 1] 范围内 (通常 raw_reward <= 0)
+        reward = np.clip(normalized_reward, -1.0, 1.0)
+        
+        # 更新 previous_makespan 用于 logging
         current_makespan = max([max(stage) for stage in self.machine_available_time])
-        diff = current_makespan - self.previous_makespan
-        self.previous_makespan = current_makespan
-        # 放大奖励，避免过小
-        reward = -diff if diff > 0 else 0.1 
+        self.previous_makespan = current_makespan 
         
         done = (self.completed_jobs == self.num_jobs)
         
-        # 4. 推进到下一个决策点
         if not done:
             self._advance_to_decision()
             

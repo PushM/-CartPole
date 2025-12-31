@@ -29,186 +29,292 @@ class HFSPEnv(gym.Env):
         if self.initial_job_times is not None:
             self.job_times = self.initial_job_times.copy()
         
-        # 动作空间：选择调度规则
-        # 0: SPT (最短加工时间优先)
-        # 1: LPT (最长加工时间优先)
-        # 2: SRPT (剩余总加工时间最短优先)
-        # 3: LRPT (剩余总加工时间最长优先)
-        # 4: FIFO (先入先出)
-        # 5: Random (随机)
-        self.action_space = gym.spaces.Discrete(6)
+        # 动作空间：选择队列中第 K 个工件 (按 SPT 排序)
+        # 0: 选第1个 (SPT)
+        # ...
+        # 4: 选第5个
+        self.k_choices = 5
+        self.action_space = gym.spaces.Discrete(self.k_choices)
         
-        # 状态空间：特征向量
-        # [每个阶段的平均机器负载, 每个阶段的排队任务数, 系统平均完工率]
-        self.state_dim = num_stages * 2 + 1
+        # 状态空间：
+        # 1. 阶段 One-Hot (num_stages)
+        # 2. 全局/机器统计特征 (num_stages * 6 + 1)
+        # 3. 候选工件特征 (Top-K jobs * 2 features: [ProcTime, RemTime])
+        self.job_feat_dim = 2
+        self.state_dim = num_stages + (num_stages * 6 + 1) + (self.k_choices * self.job_feat_dim)
         self.observation_space = gym.spaces.Box(low=0, high=np.inf, shape=(self.state_dim,), dtype=np.float32)
 
+        self.next_stage_idx = 0
+        self.next_machine_idx = 0
+
     def reset(self):
-        # 生成作业数据：[Job_ID, Stage_1_Time, Stage_2_Time, ...]
+        # 生成作业数据
         if self.initial_job_times is not None:
             self.job_times = self.initial_job_times.copy()
         else:
             self.job_times = np.random.randint(1, 10, size=(self.num_jobs, self.num_stages))
         
-        # 机器状态：记录每台机器的可用时间 [Stage][Machine_ID]
         self.machine_available_time = [[0] * m for m in self.machines_per_stage]
-        
-        # 队列状态：每个阶段的等待队列，存储 Job ID
         self.queues = [[] for _ in range(self.num_stages)]
-        
-        # 初始时，所有工件都在第0阶段的队列中
         self.queues[0] = list(range(self.num_jobs))
-        
-        # 记录每个工件在每个阶段的完成时间，用于计算 Makespan
         self.job_completion_times = np.zeros((self.num_jobs, self.num_stages))
         
         self.current_time = 0
         self.completed_jobs = 0
+        self.previous_makespan = 0
+        
+        # 推进到第一个决策点
+        self._advance_to_decision()
         
         return self._get_state()
 
-    def _get_state(self):
-        # 构建状态向量
-        state = []
-        
-        # 1. 每个阶段的平均机器负载 (归一化)
-        for s in range(self.num_stages):
-            valid_times = [t - self.current_time for t in self.machine_available_time[s] if t > self.current_time]
-            if valid_times:
-                avg_load = np.mean(valid_times)
-                state.append(avg_load)
-            else:
-                state.append(0.0)
-            
-        # 2. 每个阶段的排队数量
-        for s in range(self.num_stages):
-            state.append(len(self.queues[s]))
-            
-        # 3. 总体进度
-        state.append(self.completed_jobs / self.num_jobs)
-        
-        return np.array(state, dtype=np.float32)
-
-    def step(self, action):
-        # 执行一次调度决策：
-        # 找到第一个有空闲机器且队列不为空的阶段
-        # 如果所有机器都忙，时间推进到最早释放的那台机器
-        
-        stage_idx = -1
-        machine_idx = -1
-        
-        # 简单的离散事件模拟逻辑
-        while True:
-            # 检查是否有阶段可以调度
+    def _advance_to_decision(self):
+        # 推进时间，直到有机器空闲且队列不为空
+        # 或者所有任务完成
+        while self.completed_jobs < self.num_jobs:
+            # 1. 检查当前时间点是否有可行调度
             candidates = []
             for s in range(self.num_stages):
                 if len(self.queues[s]) > 0:
                     # 找该阶段最早空闲的机器
                     min_time = min(self.machine_available_time[s])
-                    m_idx = self.machine_available_time[s].index(min_time)
                     if min_time <= self.current_time:
+                        m_idx = self.machine_available_time[s].index(min_time)
                         candidates.append((s, m_idx))
             
             if candidates:
-                # 优先调度靠后的阶段（简化逻辑，或者由外部循环决定，这里简化为取第一个可行的）
-                # 实际上 DRL 应该决定调度哪个阶段的哪个任务，但为了简化，我们固定顺序，DRL 决定“选哪个工件”
-                # 这里我们假设 DRL 每次只针对“当前最紧急的决策点”做决策
-                stage_idx, machine_idx = candidates[0] 
-                break
-            
-            # 如果没有机器空闲，时间推进
-            # 找到整个系统中最早变为空闲的时间
+                # 找到决策点！
+                # 简单策略：优先调度靠后的阶段 (First Valid)
+                # 也可以改为随机或固定顺序，这里取第一个
+                self.next_stage_idx, self.next_machine_idx = candidates[0]
+                return
+
+            # 2. 如果没有，推进时间到下一个机器释放点
             future_times = [t for stage_times in self.machine_available_time for t in stage_times if t > self.current_time]
             if not future_times:
-                # 所有任务都处理完了？
-                if self.completed_jobs == self.num_jobs:
-                    return self._get_state(), 0, True, {}
-                else:
-                    # 还有任务在队列但没机器？(理论不应发生，除非逻辑漏洞)
-                    pass
+                # 理论上只有当所有任务都在队列中但无法处理（不可能）或已完成时才会到这
+                # 但这里 completed_jobs < num_jobs，说明还有任务没完
+                # 可能是任务还在前一阶段运行，还没到下一阶段队列
+                # 这种情况下，我们找所有运行中任务的最早完成时间
+                running_completion_times = []
+                for j in range(self.num_jobs):
+                    for s in range(self.num_stages):
+                        # 如果任务 j 在 s 阶段完成时间 > current_time，说明它还在跑？
+                        # 不完全是，job_completion_times 存的是历史。
+                        # 我们需要推断系统的下一个事件时间。
+                        # 简化：future_times 包含了所有机器释放时间。
+                        # 如果 future_times 为空，说明所有机器都在 current_time 之前释放了，但队列为空？
+                        # 这意味着所有剩余任务都在“传输中”？不，本模型没有传输时间。
+                        # 意味着所有未完成任务都在前序阶段处理中。
+                        pass
+                break # Should not happen if logic is correct
             
-            if future_times:
-                self.current_time = min(future_times)
-            else:
-                 # 应该结束了
-                 current_makespan = max([max(stage) for stage in self.machine_available_time])
-                 return self._get_state(), 0, True, {"makespan": current_makespan}
+            self.current_time = min(future_times)
 
-        # ---------------------------------------
-        # 根据 Action 选择工件
-        # ---------------------------------------
+    def _get_state(self):
+        # 1. Stage One-Hot
+        stage_vec = np.zeros(self.num_stages, dtype=np.float32)
+        if self.completed_jobs < self.num_jobs:
+            stage_vec[self.next_stage_idx] = 1.0
+        
+        # 2. 统计特征 (原有)
+        stat_state = []
+        for s in range(self.num_stages):
+            valid_times = [t - self.current_time for t in self.machine_available_time[s] if t > self.current_time]
+            if not valid_times: valid_times = [0.0]
+            avg_load = np.mean(valid_times)
+            std_load = np.std(valid_times) if len(valid_times) > 1 else 0.0
+            queue_len = len(self.queues[s])
+            stat_state.extend([avg_load, std_load, queue_len])
+            
+            if queue_len > 0:
+                q_times = [self.job_times[j, s] for j in self.queues[s]]
+                stat_state.extend([np.mean(q_times), np.max(q_times), np.min(q_times)])
+            else:
+                stat_state.extend([0.0, 0.0, 0.0])
+        stat_state.append(self.completed_jobs / self.num_jobs)
+        
+        # 3. 候选工件特征 (Top-K)
+        job_feats = []
+        if self.completed_jobs < self.num_jobs:
+            current_queue = self.queues[self.next_stage_idx]
+            # 按 SPT (当前阶段加工时间) 排序
+            # 我们需要获取工件ID
+            sorted_indices = np.argsort([self.job_times[j, self.next_stage_idx] for j in current_queue])
+            sorted_jobs = [current_queue[i] for i in sorted_indices]
+            
+            for k in range(self.k_choices):
+                if k < len(sorted_jobs):
+                    job_id = sorted_jobs[k]
+                    proc_time = self.job_times[job_id, self.next_stage_idx]
+                    rem_time = np.sum(self.job_times[job_id, self.next_stage_idx:])
+                    job_feats.extend([proc_time, rem_time])
+                else:
+                    job_feats.extend([0.0, 0.0])
+        else:
+            job_feats = [0.0] * (self.k_choices * self.job_feat_dim)
+
+        return np.concatenate([stage_vec, stat_state, job_feats])
+
+    def step(self, action):
+        if self.completed_jobs == self.num_jobs:
+            return self._get_state(), 0, True, {"makespan": self.previous_makespan}
+
+        # 1. 执行动作：从当前决策阶段的队列中选一个工件
+        stage_idx = self.next_stage_idx
+        machine_idx = self.next_machine_idx
         queue = self.queues[stage_idx]
-        selected_job_idx = 0 # 在 queue 中的索引
         
-        if len(queue) > 1:
-            if action == 0: # SPT
-                times = [self.job_times[j, stage_idx] for j in queue]
-                selected_job_idx = np.argmin(times)
-            elif action == 1: # LPT
-                times = [self.job_times[j, stage_idx] for j in queue]
-                selected_job_idx = np.argmax(times)
-            elif action == 2: # SRPT (剩余总时间)
-                rem_times = [np.sum(self.job_times[j, stage_idx:]) for j in queue]
-                selected_job_idx = np.argmin(rem_times)
-            elif action == 3: # LRPT
-                rem_times = [np.sum(self.job_times[j, stage_idx:]) for j in queue]
-                selected_job_idx = np.argmax(rem_times)
-            elif action == 4: # FIFO
-                selected_job_idx = 0
-            elif action == 5: # Random
-                selected_job_idx = np.random.randint(0, len(queue))
+        # 修正 Pop 逻辑
+        # 我们重新获取排序后的 job_id
+        # queue is a list of job_ids
+        times = [(self.job_times[j, stage_idx], j) for j in queue]
+        times.sort() # sort by time
         
-        job_id = queue.pop(selected_job_idx)
+        target_k = action if action < len(times) else len(times) - 1
+        selected_job_id = times[target_k][1]
         
-        # ---------------------------------------
-        # 执行任务
-        # ---------------------------------------
-        proc_time = self.job_times[job_id, stage_idx]
+        self.queues[stage_idx].remove(selected_job_id)
+        
+        # 2. 计算时间
+        proc_time = self.job_times[selected_job_id, stage_idx]
         start_time = max(self.current_time, self.machine_available_time[stage_idx][machine_idx])
         
-        # 如果是后续阶段，必须等上一阶段完成
         if stage_idx > 0:
-            prev_finish = self.job_completion_times[job_id, stage_idx - 1]
+            prev_finish = self.job_completion_times[selected_job_id, stage_idx - 1]
             start_time = max(start_time, prev_finish)
             
         finish_time = start_time + proc_time
         
-        # 更新状态
         self.machine_available_time[stage_idx][machine_idx] = finish_time
-        self.job_completion_times[job_id, stage_idx] = finish_time
+        self.job_completion_times[selected_job_id, stage_idx] = finish_time
         
-        # 如果不是最后一个阶段，加入下一阶段队列
         if stage_idx < self.num_stages - 1:
-            self.queues[stage_idx + 1].append(job_id)
+            self.queues[stage_idx + 1].append(selected_job_id)
         else:
             self.completed_jobs += 1
             
-        # 计算奖励：负的 Makespan 增量 (鼓励尽快完成)
-        # 这里用一种常用的密集奖励：-1 * (当前系统最大完工时间的变化)
+        # 3. 计算奖励
         current_makespan = max([max(stage) for stage in self.machine_available_time])
-        reward = -0.1 # 每一步的小惩罚
+        diff = current_makespan - self.previous_makespan
+        self.previous_makespan = current_makespan
+        # 放大奖励，避免过小
+        reward = -diff if diff > 0 else 0.1 
         
         done = (self.completed_jobs == self.num_jobs)
-        if done:
-            # 完成奖励，与 Makespan 成反比
-            reward += 1000.0 / current_makespan
+        
+        # 4. 推进到下一个决策点
+        if not done:
+            self._advance_to_decision()
             
         return self._get_state(), reward, done, {"makespan": current_makespan}
 
 # ==========================================
 # 2. Neural Network & Agents
 # ==========================================
-class QNetwork(nn.Module):
+class SumTree:
+    def __init__(self, capacity):
+        self.capacity = capacity
+        self.tree = np.zeros(2 * capacity - 1)
+        self.data = np.zeros(capacity, dtype=object)
+        self.write = 0
+        self.n_entries = 0
+
+    def _propagate(self, idx, change):
+        parent = (idx - 1) // 2
+        self.tree[parent] += change
+        if parent != 0:
+            self._propagate(parent, change)
+
+    def _retrieve(self, idx, s):
+        left = 2 * idx + 1
+        right = left + 1
+        if left >= len(self.tree):
+            return idx
+        if s <= self.tree[left]:
+            return self._retrieve(left, s)
+        else:
+            return self._retrieve(right, s - self.tree[left])
+
+    def total(self):
+        return self.tree[0]
+
+    def add(self, p, data):
+        idx = self.write + self.capacity - 1
+        self.data[self.write] = data
+        self.update(idx, p)
+        self.write += 1
+        if self.write >= self.capacity:
+            self.write = 0
+        if self.n_entries < self.capacity:
+            self.n_entries += 1
+
+    def update(self, idx, p):
+        change = p - self.tree[idx]
+        self.tree[idx] = p
+        self._propagate(idx, change)
+
+    def get(self, s):
+        idx = self._retrieve(0, s)
+        data_idx = idx - self.capacity + 1
+        return (idx, self.tree[idx], self.data[data_idx])
+
+class PrioritizedReplayBuffer:
+    def __init__(self, capacity, alpha=0.6):
+        self.tree = SumTree(capacity)
+        self.alpha = alpha
+        self.capacity = capacity
+
+    def add(self, error, sample):
+        p = (error + 1e-5) ** self.alpha
+        self.tree.add(p, sample)
+
+    def sample(self, n, beta=0.4):
+        batch = []
+        idxs = []
+        segment = self.tree.total() / n
+        priorities = []
+        for i in range(n):
+            a = segment * i
+            b = segment * (i + 1)
+            s = random.uniform(a, b)
+            (idx, p, data) = self.tree.get(s)
+            batch.append(data)
+            idxs.append(idx)
+            priorities.append(p)
+        sampling_probabilities = np.array(priorities) / self.tree.total()
+        is_weight = np.power(self.tree.n_entries * sampling_probabilities, -beta)
+        is_weight /= is_weight.max()
+        return batch, idxs, is_weight
+
+    def update(self, idx, error):
+        p = (error + 1e-5) ** self.alpha
+        self.tree.update(idx, p)
+    
+    def __len__(self):
+        return self.tree.n_entries
+
+class DuelingQNetwork(nn.Module):
     def __init__(self, state_dim, action_dim):
-        super(QNetwork, self).__init__()
+        super(DuelingQNetwork, self).__init__()
         self.fc1 = nn.Linear(state_dim, 128)
         self.fc2 = nn.Linear(128, 128)
-        self.fc3 = nn.Linear(128, action_dim)
+        
+        # Value stream
+        self.fc_value = nn.Linear(128, 1)
+        
+        # Advantage stream
+        self.fc_advantage = nn.Linear(128, action_dim)
         
     def forward(self, x):
         x = F.relu(self.fc1(x))
         x = F.relu(self.fc2(x))
-        return self.fc3(x)
+        
+        val = self.fc_value(x)
+        adv = self.fc_advantage(x)
+        
+        # Q(s,a) = V(s) + (A(s,a) - mean(A(s,a)))
+        return val + adv - adv.mean(dim=1, keepdim=True)
 
 class DDTD_Agent:
     def __init__(self, state_dim, action_dim, max_episodes=800):
@@ -220,15 +326,19 @@ class DDTD_Agent:
         self.epsilon_min = 0.1
         self.epsilon_decay_step = (self.epsilon - self.epsilon_min) / max_episodes
         self.batch_size = 100
-        self.memory = deque(maxlen=3000)
+        # Use Prioritized Replay Buffer
+        self.memory = PrioritizedReplayBuffer(capacity=3000)
+        self.beta = 0.4
+        self.beta_increment = (1.0 - 0.4) / max_episodes
         self.tau = 0.1
         
-        self.q_net = QNetwork(state_dim, action_dim)
-        self.target_net = QNetwork(state_dim, action_dim)
+        # Use Dueling Network
+        self.q_net = DuelingQNetwork(state_dim, action_dim)
+        self.target_net = DuelingQNetwork(state_dim, action_dim)
         self.target_net.load_state_dict(self.q_net.state_dict())
         
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.lr)
-        self.loss_fn = nn.MSELoss()
+        self.loss_fn = nn.MSELoss(reduction='none') # Need element-wise loss for PER
 
     def select_action(self, state, training=True):
         if training and np.random.rand() < self.epsilon:
@@ -239,11 +349,15 @@ class DDTD_Agent:
         return torch.argmax(q_values).item()
 
     def store_transition(self, s, a, r, ns, d):
-        self.memory.append((s, a, r, ns, d))
+        # Initial priority: max priority or high constant
+        error = 1.0 # High priority for new experiences
+        self.memory.add(error, (s, a, r, ns, d))
 
     def update(self):
         if len(self.memory) < self.batch_size: return
-        batch = random.sample(self.memory, self.batch_size)
+        
+        # Sample from PER
+        batch, idxs, is_weights = self.memory.sample(self.batch_size, self.beta)
         states, actions, rewards, next_states, dones = zip(*batch)
         
         states = torch.FloatTensor(np.array(states))
@@ -251,6 +365,7 @@ class DDTD_Agent:
         rewards = torch.FloatTensor(rewards).unsqueeze(1)
         next_states = torch.FloatTensor(np.array(next_states))
         dones = torch.FloatTensor(dones).unsqueeze(1)
+        is_weights = torch.FloatTensor(is_weights).unsqueeze(1)
         
         # Double DQN Logic
         with torch.no_grad():
@@ -259,7 +374,14 @@ class DDTD_Agent:
             target_q = rewards + (1 - dones) * self.gamma * next_q_values
             
         current_q = self.q_net(states).gather(1, actions)
-        loss = self.loss_fn(current_q, target_q)
+        
+        # Weighted Loss
+        loss = (is_weights * F.mse_loss(current_q, target_q, reduction='none')).mean()
+        
+        # Update Priorities
+        errors = torch.abs(current_q - target_q).detach().numpy()
+        for i in range(self.batch_size):
+            self.memory.update(idxs[i], errors[i][0])
         
         self.optimizer.zero_grad()
         loss.backward()
@@ -267,6 +389,8 @@ class DDTD_Agent:
         
         if self.epsilon > self.epsilon_min:
             self.epsilon -= self.epsilon_decay_step
+        
+        self.beta = min(1.0, self.beta + self.beta_increment)
         self.soft_update_target_network()
 
     def soft_update_target_network(self):
@@ -279,13 +403,15 @@ class DDTD_Agent:
 class DQN_Agent(DDTD_Agent):
     def update(self):
         if len(self.memory) < self.batch_size: return
-        batch = random.sample(self.memory, self.batch_size)
+        
+        batch, idxs, is_weights = self.memory.sample(self.batch_size, self.beta)
         states, actions, rewards, next_states, dones = zip(*batch)
         states = torch.FloatTensor(np.array(states))
         actions = torch.LongTensor(actions).unsqueeze(1)
         rewards = torch.FloatTensor(rewards).unsqueeze(1)
         next_states = torch.FloatTensor(np.array(next_states))
         dones = torch.FloatTensor(dones).unsqueeze(1)
+        is_weights = torch.FloatTensor(is_weights).unsqueeze(1)
 
         # Standard DQN Logic: max_a Q(s', a)
         with torch.no_grad():
@@ -293,13 +419,20 @@ class DQN_Agent(DDTD_Agent):
             target_q = rewards + (1 - dones) * self.gamma * next_q_values
 
         current_q = self.q_net(states).gather(1, actions)
-        loss = self.loss_fn(current_q, target_q)
+        
+        loss = (is_weights * F.mse_loss(current_q, target_q, reduction='none')).mean()
+        
+        errors = torch.abs(current_q - target_q).detach().numpy()
+        for i in range(self.batch_size):
+            self.memory.update(idxs[i], errors[i][0])
+            
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
         
         if self.epsilon > self.epsilon_min:
             self.epsilon -= self.epsilon_decay_step
+        self.beta = min(1.0, self.beta + self.beta_increment)
         self.soft_update_target_network()
 
 class DeepSarsa_Agent:
@@ -315,8 +448,8 @@ class DeepSarsa_Agent:
         self.memory = deque(maxlen=3000)
         self.tau = 0.1 
         
-        self.q_net = QNetwork(state_dim, action_dim)
-        self.target_net = QNetwork(state_dim, action_dim)
+        self.q_net = DuelingQNetwork(state_dim, action_dim)
+        self.target_net = DuelingQNetwork(state_dim, action_dim)
         self.target_net.load_state_dict(self.q_net.state_dict())
         
         self.optimizer = optim.Adam(self.q_net.parameters(), lr=self.lr)
@@ -400,8 +533,42 @@ def neh_algorithm(num_jobs, num_stages, job_times):
         
     return best_makespan
 
-def calculate_makespan_from_sequence(seq, num_stages, job_times):
-    return 0 # Placeholder
+def calculate_makespan_from_sequence(seq, num_stages, job_times, machines_per_stage):
+    # Simulate the schedule to calculate makespan
+    # seq: list of job IDs (order for Stage 0)
+    
+    current_jobs = list(seq)
+    # Track completion time of each job at the previous stage (initially 0)
+    job_completion = {j: 0 for j in seq}
+    
+    # Track available time of each machine at each stage
+    machine_avail = [[0] * m for m in machines_per_stage]
+    
+    for s in range(num_stages):
+        if s > 0:
+            # For subsequent stages, process jobs in order of their arrival (completion at previous stage)
+            # Stable sort preserves relative order for simultaneous arrivals (FIFO)
+            current_jobs.sort(key=lambda j: job_completion[j])
+        
+        for job_id in current_jobs:
+            # Find earliest available machine in current stage
+            stage_machines = machine_avail[s]
+            best_m = 0
+            min_t = stage_machines[0]
+            for m in range(1, len(stage_machines)):
+                if stage_machines[m] < min_t:
+                    min_t = stage_machines[m]
+                    best_m = m
+            
+            arrival = job_completion[job_id]
+            start = max(min_t, arrival)
+            finish = start + job_times[job_id, s]
+            
+            machine_avail[s][best_m] = finish
+            job_completion[job_id] = finish
+            
+    # Makespan is the max availability time at the last stage
+    return max(machine_avail[-1])
 
 # ==========================================
 # 3. 训练与对比
@@ -441,14 +608,7 @@ def load_fernandez_instance(file_path):
         return None, None, None, None
 
 def evaluate_sequence(env, sequence):
-    env.reset()
-    env.queues[0] = list(sequence)
-    done = False
-    final_makespan = 0
-    while not done:
-        _, _, done, info = env.step(4) # FIFO
-        final_makespan = info['makespan']
-    return final_makespan
+    return calculate_makespan_from_sequence(sequence, env.num_stages, env.job_times, env.machines_per_stage)
 
 def run_neh(env):
     total_times = np.sum(env.job_times, axis=1)
@@ -486,15 +646,18 @@ def run_single_instance(file_path):
     # 2. Standard DQN
     agent_dqn = DQN_Agent(env.state_dim, env.action_space.n, max_episodes=num_episodes)
     best_dqn = float('inf')
+    global_step = 0
     for _ in range(num_episodes):
         state = env.reset()
         done = False
         ms = 0
         while not done:
+            global_step += 1
             action = agent_dqn.select_action(state)
             next_state, reward, done, info = env.step(action)
             agent_dqn.store_transition(state, action, reward, next_state, done)
-            agent_dqn.update()
+            if global_step % 10 == 0:
+                agent_dqn.update()
             state = next_state
             ms = info['makespan']
         if ms < best_dqn: best_dqn = ms
@@ -503,38 +666,45 @@ def run_single_instance(file_path):
     # 3. Deep Sarsa (DS)
     agent_ds = DeepSarsa_Agent(env.state_dim, env.action_space.n, max_episodes=num_episodes)
     best_ds = float('inf')
+    global_step = 0
     for _ in range(num_episodes):
         state = env.reset()
         done = False
         ms = 0
         action = agent_ds.select_action(state)
         while not done:
+            global_step += 1
             next_state, reward, done, info = env.step(action)
             ms = info['makespan']
             if not done:
                 next_action = agent_ds.select_action(next_state)
                 agent_ds.store_transition(state, action, reward, next_state, next_action, done)
-                agent_ds.update()
+                if global_step % 10 == 0:
+                    agent_ds.update()
                 state = next_state
                 action = next_action
             else:
                 agent_ds.store_transition(state, action, reward, next_state, 0, done)
-                agent_ds.update()
+                if global_step % 10 == 0:
+                    agent_ds.update()
         if ms < best_ds: best_ds = ms
     agent_ds.save_model(f"trained_models/{filename}_DS.pth")
 
     # 4. DDTD (Ours)
     agent_ddtd = DDTD_Agent(env.state_dim, env.action_space.n, max_episodes=num_episodes)
     best_ddtd = float('inf')
+    global_step = 0
     for _ in range(num_episodes):
         state = env.reset()
         done = False
         ms = 0
         while not done:
+            global_step += 1
             action = agent_ddtd.select_action(state)
             next_state, reward, done, info = env.step(action)
             agent_ddtd.store_transition(state, action, reward, next_state, done)
-            agent_ddtd.update()
+            if global_step % 10 == 0:
+                agent_ddtd.update()
             state = next_state
             ms = info['makespan']
         if ms < best_ddtd: best_ddtd = ms
@@ -581,13 +751,21 @@ def run_comparison():
     
     instance_files = glob.glob(os.path.join(data_dir, "*.txt"))
     
+    # target_instances = {
+    #     "10_5_4", "10_10_5", "10_15_1", "10_20_8",
+    #     "15_5_9", "15_10_2", "15_15_7", "15_20_6",
+    #     "20_5_4", "20_10_5", "20_15_1", "20_20_8",
+    #     "25_5_9", "25_10_2", "25_15_7", "25_20_6",
+    #     "30_5_7", "30_10_1", "30_15_5", "30_20_7",
+    #     "35_5_3", "35_10_4", "35_15_8", "35_20_6"
+    # }
     target_instances = {
         "10_5_4", "10_10_5", "10_15_1", "10_20_8",
-        "15_5_9", "15_10_2", "15_15_7", "15_20_6",
-        "20_5_4", "20_10_5", "20_15_1", "20_20_8",
-        "25_5_9", "25_10_2", "25_15_7", "25_20_6",
-        "30_5_7", "30_10_1", "30_15_5", "30_20_7",
-        "35_5_3", "35_10_4", "35_15_8", "35_20_6"
+        # "15_5_9", "15_10_2", "15_15_7", "15_20_6",
+        # "20_5_4", "20_10_5", "20_15_1", "20_20_8",
+        # "25_5_9", "25_10_2", "25_15_7", "25_20_6",
+        # "30_5_7", "30_10_1", "30_15_5", "30_20_7",
+        # "35_5_3", "35_10_4", "35_15_8", "35_20_6"
     }
     
     selected_files = []
